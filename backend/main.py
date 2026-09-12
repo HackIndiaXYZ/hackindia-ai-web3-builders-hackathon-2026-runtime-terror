@@ -2,7 +2,7 @@ import os
 import requests
 import uuid
 from typing import Tuple
-from fastapi import FastAPI, HTTPException, status, UploadFile, File
+from fastapi import FastAPI, HTTPException, status, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, List
@@ -96,7 +96,12 @@ async def analyze_image(file: UploadFile = File(...)):
     
     
 @app.post("/incident/from-image")
-async def create_incident_from_image(file: UploadFile = File(...)):
+async def create_incident_from_image(
+    file: UploadFile = File(...),
+    location: Optional[str] = Form(None),
+    latitude: Optional[float] = Form(None),
+    longitude: Optional[float] = Form(None)
+):
     try:
         # Validate image
         if not file.content_type or not file.content_type.startswith("image/"):
@@ -108,53 +113,102 @@ async def create_incident_from_image(file: UploadFile = File(...)):
         image_bytes = await file.read()
 
         if not image_bytes:
-            raise HTTPException(status_code=400,detail="Uploaded image is empty.")
+            raise HTTPException(
+                status_code=400,
+                detail="Uploaded image is empty."
+            )
 
-        analysis = analyze_accident_image(image_bytes=image_bytes,mime_type=file.content_type)
-        incident_type = analysis.get("incident_type","ACCIDENT_DETECTED")
-        severity = analysis.get("severity","MEDIUM")
-        severity_score = analysis.get("severity_score",50)
-        priority = analysis.get("priority","P2")
-        people_affected = analysis.get("people_affected")
-        description = analysis.get("description","")
-        ai_confidence = analysis.get("ai_confidence")
+        # AI image analysis
+        analysis = analyze_accident_image(
+            image_bytes=image_bytes,
+            mime_type=file.content_type
+        )
+
+        incident_type = analysis.get(
+            "incident_type",
+            "ACCIDENT_DETECTED"
+        )
+
+        severity = analysis.get(
+            "severity",
+            "MEDIUM"
+        )
+
+        severity_score = analysis.get(
+            "severity_score",
+            50
+        )
+
+        priority = analysis.get(
+            "priority",
+            "P2"
+        )
+
+        people_affected = analysis.get(
+            "people_affected"
+        )
+
+        description = analysis.get(
+            "description",
+            ""
+        )
+
+        ai_confidence = analysis.get(
+            "ai_confidence"
+        )
+
         incident_id = f"AC-{uuid.uuid4().hex[:8].upper()}"
         created_at = datetime.utcnow().isoformat()
 
-        response = supabase.table("cards").insert({
-            "acci_id": incident_id,
-            "incident_type": incident_type,
-            "location": "Location Pending",
-            "severity": severity,
-            "severity_score": severity_score,
-            "priority": priority,
-            "people_affected": people_affected,
-            "ai_confidence": ai_confidence,
-            "description": description,
-            "status": "WAITING_FOR_ACK",
-            "created_at": created_at
-        }).execute()
+        # Use supplied location, otherwise fallback
+        incident_location = location or "Location Pending"
+
+        # Save incident to Supabase
+        response = (
+            supabase
+            .table("cards")
+            .insert({
+                "acci_id": incident_id,
+                "incident_type": incident_type,
+                "location": incident_location,
+                "latitude": latitude,
+                "longitude": longitude,
+                "severity": severity,
+                "severity_score": severity_score,
+                "priority": priority,
+                "people_affected": people_affected,
+                "ai_confidence": ai_confidence,
+                "description": description,
+                "status": "WAITING_FOR_ACK",
+                "created_at": created_at
+            })
+            .execute()
+        )
 
         if not response.data:
             raise HTTPException(
                 status_code=500,
                 detail="Failed to create incident in Supabase."
             )
-            
+
+        # Trigger n8n
         n8n_payload = {
             "acci_id": incident_id,
             "priority": priority,
             "status": "UNACKNOWLEDGED",
             "severity_score": severity_score,
-            "location": "Location Pending",
+            "location": incident_location,
+            "latitude": latitude,
+            "longitude": longitude,
             "event": incident_type,
-
             "incident_type": incident_type,
             "severity": severity,
             "people_affected": people_affected,
             "description": description,
             "ai_confidence": ai_confidence
         }
+
+        n8n_triggered = False
 
         try:
             n8n_response = requests.post(
@@ -167,17 +221,6 @@ async def create_incident_from_image(file: UploadFile = File(...)):
 
         except requests.RequestException:
             n8n_triggered = False
-            
-        return {
-            "incident_id": incident_id,
-            "analysis": { "incident_type": incident_type, "severity": severity, "severity_score": severity_score,
-            "priority": priority, "people_affected": people_affected, "description": description, "ai_confidence": ai_confidence
-            },
-            "location": "Location Pending",
-            "status": "WAITING_FOR_ACK",
-            "created_at": created_at,
-            "n8n_triggered": n8n_triggered
-        }
 
         return {
             "incident_id": incident_id,
@@ -190,17 +233,23 @@ async def create_incident_from_image(file: UploadFile = File(...)):
                 "description": description,
                 "ai_confidence": ai_confidence
             },
-            "location": "Location Pending",
+            "location": incident_location,
+            "latitude": latitude,
+            "longitude": longitude,
             "status": "WAITING_FOR_ACK",
-            "created_at": created_at
+            "created_at": created_at,
+            "n8n_triggered": n8n_triggered
         }
 
     except HTTPException:
         raise
 
     except Exception as e:
-        raise HTTPException(status_code=500,detail=f"Image incident creation failed: {str(e)}")
-    
+        raise HTTPException(
+            status_code=500,
+            detail=f"Image incident creation failed: {str(e)}"
+        )
+
     
 @app.get("/incident/{incident_id}")
 def get_incident(incident_id: str):
@@ -221,10 +270,6 @@ def get_incident(incident_id: str):
         )
 
     return result.data[0]
-    if not result.data:
-        raise HTTPException(status_code=404,detail="Incident not found")
-
-    return result.data
     
 
 @app.post("/incident")
@@ -309,10 +354,10 @@ async def escalate_incident(incident_id: str):
             raise HTTPException(status_code=404,detail=f"Incident {incident_id} not found")
 
         current_status = current.data[0]["status"]
-        if current_status == "ACKNOWLEDGED":
+        if current_status == "Acknowledged":
             return {
                 "incident_id": incident_id,
-                "status": "ACKNOWLEDGED",
+                "status": "Acknowledged",
                 "escalated": False,
                 "message": "Incident already acknowledged. Escalation cancelled."
             }
@@ -325,7 +370,7 @@ async def escalate_incident(incident_id: str):
             .table("cards")
             .update({"status": "ESCALATED","escalated_at": escalated_at})
             .eq("acci_id", incident_id)
-            .neq("status", "ACKNOWLEDGED")
+            .neq("status", "Acknowledged")
             .execute()
         )
 
@@ -340,14 +385,46 @@ async def escalate_incident(incident_id: str):
         raise HTTPException(status_code=500,detail=f"Escalation failed: {str(e)}")
         
 
-@app.get("/cards",response_model=List[IncidentCardResponse],status_code=status.HTTP_200_OK)
+
+@app.get("/cards", status_code=status.HTTP_200_OK)
 async def get_cards():
     try:
-        response = supabase.table("cards").select("*").execute()
+        response = (
+            supabase
+            .table("cards")
+            .select("*")
+            .order("created_at", desc=True)
+            .execute()
+        )
+
         return response.data
 
     except Exception as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,detail=f"Database Retrieval Anomaly: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database Retrieval Anomaly: {str(e)}"
+        )
+
+
+
+@app.get("/supervisor/incidents")
+async def get_supervisor_incidents():
+    try:
+        response = (
+            supabase
+            .table("cards")
+            .select("*")
+            .order("created_at", desc=True)
+            .execute()
+        )
+
+        return response.data
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to retrieve supervisor incidents: {str(e)}"
+        )
 
 
 @app.get("/", status_code=status.HTTP_200_OK, include_in_schema=False)
